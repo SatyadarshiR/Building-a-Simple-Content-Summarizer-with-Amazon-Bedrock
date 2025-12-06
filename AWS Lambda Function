@@ -1,0 +1,127 @@
+import boto3
+import json
+import os
+from typing import Dict, Any
+
+# --- Configuration ---
+# Choose your Foundation Model (FM) for summarization
+# Claude 3 Sonnet is highly effective for these tasks.
+MODEL_ID = os.environ.get(
+    'MODEL_ID', 
+    'anthropic.claude-3-sonnet-20240229-v1:0'
+)
+# Ensure the Lambda environment variable 'AWS_REGION' is set or default to 'us-east-1'
+REGION = os.environ.get('AWS_REGION', 'us-east-1') 
+
+# Initialize the Bedrock Runtime client globally (outside the handler)
+# This improves performance by reusing the connection across invocations.
+try:
+    bedrock_client = boto3.client(
+        service_name='bedrock-runtime',
+        region_name=REGION
+    )
+    print(f"Bedrock client initialized for region {REGION} using model {MODEL_ID}")
+except Exception as e:
+    print(f"Error initializing Bedrock client: {e}")
+    bedrock_client = None
+
+
+def create_claude_prompt(text_to_summarize: str) -> str:
+    """
+    Creates a detailed prompt following Anthropic's prompt format for Claude models.
+    This ensures the model behaves consistently as a summarization tool.
+    """
+    prompt_template = f"""
+    Human: You are an expert text summarization tool. Your goal is to extract the most important information from the provided text and present it as a concise, easy-to-read summary.
+
+    **Instructions:**
+    1. Read the entire text provided in the <text> tags.
+    2. Generate a summary of exactly five to seven concise bullet points.
+    3. The summary must capture the main ideas, key facts, and any defined action items.
+    4. Do NOT include any introductory or concluding sentences.
+
+    <text>
+    {text_to_summarize}
+    </text>
+
+    Assistant:
+    """
+    return prompt_template
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """
+    The main handler for the AWS Lambda function.
+    Processes input text, invokes Amazon Bedrock, and returns the summary.
+    """
+    if not bedrock_client:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'Bedrock client failed to initialize. Check Lambda configuration and IAM role.'})
+        }
+        
+    try:
+        # 1. Parse Input
+        # Assuming the input from API Gateway is a JSON body
+        if 'body' in event:
+            body = json.loads(event['body'])
+        else:
+            # For direct Lambda testing
+            body = event
+            
+        input_text = body.get('text', '')
+
+        if not input_text:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'No text provided for summarization. Please send a JSON body with a "text" key.'})
+            }
+
+        # 2. Prepare Prompt and Parameters
+        prompt = create_claude_prompt(input_text)
+
+        # Claude 3 Model Parameters (using the older `invoke_model` API format)
+        body_data = {
+            "prompt": prompt,
+            "max_tokens_to_sample": 2048,
+            "temperature": 0.3, # Keeps the summary factual but not rigid
+            "top_p": 0.9,
+            "stop_sequences": ["\n\nHuman:"] # Stop sequence for Claude models
+        }
+        
+        # 3. Invoke Bedrock Model
+        response = bedrock_client.invoke_model(
+            body=json.dumps(body_data),
+            modelId=MODEL_ID,
+            accept='application/json',
+            contentType='application/json'
+        )
+
+        # 4. Parse Model Response
+        response_body = json.loads(response.get('body').read())
+        
+        # The Claude response text is in the 'completion' field
+        summary_text = response_body.get('completion', 'Error: Summary could not be generated.')
+
+        # Clean up the output to remove any leading/trailing whitespace
+        final_summary = summary_text.strip()
+        
+        # 5. Return Result
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*' # Important for CORS if connecting a web frontend
+            },
+            'body': json.dumps({
+                'summary': final_summary,
+                'model_used': MODEL_ID,
+                'input_length': len(input_text)
+            })
+        }
+
+    except Exception as e:
+        print(f"Error during summarization: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': f'Internal server error: {str(e)}'})
+        }
